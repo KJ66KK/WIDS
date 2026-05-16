@@ -1,8 +1,7 @@
-fastapi
-uvicorn
 scapy
 paho-mqtt
 pydantic
 sqlalchemy
-sqlite3-api
 python-dotenv
+rich
+psutil
