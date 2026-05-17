@@ -22,6 +22,7 @@ class Alert(Base):
     id = Column(Integer, primary_key=True, index=True)
     event_type = Column(String)      # Type of attack (e.g., DEAUTH)
     source_mac = Column(String)      # MAC address of the attacker
+    source_ip = Column(String, nullable=True) # IP address of the attacker (if available)
     signal_strength = Column(Integer, nullable=True) # How close they are (RSSI)
     timestamp = Column(DateTime, default=datetime.datetime.utcnow) # When it happened
     details = Column(JSON, nullable=True) # Flexible field for extra data (SSID, counts, etc.)

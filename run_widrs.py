@@ -3,8 +3,10 @@ import threading
 import json
 import os
 import psutil
+import socket
 import scapy.all as scapy
-from scapy.layers.dot11 import Dot11Deauth, Dot11Beacon
+from scapy.layers.dot11 import Dot11Deauth, Dot11Beacon, Dot11
+from scapy.layers.inet import IP
 import paho.mqtt.client as mqtt
 from sqlalchemy.orm import Session
 from backend.database import models
@@ -16,148 +18,152 @@ from rich.panel import Panel
 from rich.layout import Layout
 from rich import box
 import datetime
+import uuid
+import argparse
+import sys
 
 # =================================================================
 # ⚙️ CONFIGURATION SETTINGS
 # =================================================================
 
 # 📡 DETECTION THRESHOLDS
-# How sensitive should the sniffer be?
-DEAUTH_THRESHOLD = 10  # Number of packets to trigger an alert
-WINDOW_SECONDS = 5     # Timeframe (in seconds) to count those packets
+DEAUTH_THRESHOLD = 5   # Low for testing
+ANOMALY_THRESHOLD = 300 # Flag ANY MAC sending > 200 packets in 5s
+WINDOW_SECONDS = 5     
 
-# 🌐 MQTT SETTINGS (T-Embed Communication)
-# Match these to your T-Embed settings in Bruce Firmware
-MQTT_BROKER = "localhost" # Set to "localhost" if Mosquitto is on this PC
-MQTT_PORT = 1883           # Default Mosquitto port
-MQTT_TOPIC = "widrs/alerts" # The topic Bruce publishes to
+# ☁️ UNIVERSAL CLOUD BRIDGE
+MQTT_BROKER = "broker.hivemq.com"
+MQTT_PORT = 1883
+MQTT_TOPIC = "widrs/alerts/global_test" 
 
 # =================================================================
 
 console = Console()
-packet_counts = {} # Stores MAC -> [timestamps] for flood detection
+packet_counts = {} 
+anomaly_counts = {} # Tracks total packets per MAC (for blind Windows cards)
 stop_event = threading.Event()
+mqtt_status = "Connecting..."
 
-# --- UTILS: Network & Interface ---
+# --- UTILS ---
 
-def get_wifi_interface():
-    """
-    Automatically finds your active WiFi interface.
-    It looks for common names (Wi-Fi, wlan0) and ensures the interface
-    is currently UP and has an assigned IP address.
-    """
-    addrs = psutil.net_if_addrs()
-    stats = psutil.net_if_stats()
-    
-    wifi_prefixes = ('wi-fi', 'wlan', 'wlp', 'wifi')
-    
-    # Check for specifically named WiFi adapters first
-    for iface, iface_addrs in addrs.items():
-        if any(prefix in iface.lower() for prefix in wifi_prefixes):
-            if iface in stats and stats[iface].isup:
-                if any(addr.family == 2 for addr in iface_addrs): # Check for IPv4
-                    return iface
-    
-    # Fallback: find any active interface that isn't a loopback
-    for iface, iface_addrs in addrs.items():
-        if iface == 'lo' or iface.startswith('Loopback'):
-            continue
-        if iface in stats and stats[iface].isup:
-            if any(addr.family == 2 for addr in iface_addrs):
-                return iface
-    return None
-
-def log_alert(event_type, source_mac, details, signal=None):
+def log_alert(event_type, source_mac, details, signal=None, source_ip=None):
     """Saves a detected threat directly into the local SQLite database."""
     db = SessionLocal()
     try:
         db_alert = models.Alert(
-            event_type=event_type,
-            source_mac=source_mac,
-            signal_strength=signal,
-            details=details
+            event_type=event_type, source_mac=source_mac,
+            source_ip=source_ip,
+            signal_strength=signal, details=details
         )
         db.add(db_alert)
         db.commit()
     finally:
         db.close()
 
-# --- DETECTION: Packet Sniffing ---
+# --- DETECTION: Enhanced Engine ---
 
 def packet_callback(packet):
     """
-    Analyzes every captured packet.
-    If it's a Deauthentication frame, we track it for flood detection.
+    Enhanced callback that catches attacks even if the Windows card 
+    is 'blind' to specific WiFi management frames.
     """
+    now = time.time()
+    source_mac = "UNKNOWN"
+    source_ip = None
+    
+    # Try to extract the MAC address
+    if packet.haslayer(Dot11):
+        source_mac = packet.addr2 if packet.addr2 else "UNKNOWN"
+    elif hasattr(packet, 'src'):
+        source_mac = packet.src
+
+    # Try to extract the IP address if it exists
+    if packet.haslayer(IP):
+        source_ip = packet[IP].src
+
+    if source_mac == "UNKNOWN" and not source_ip: return
+
+    # 1. SPECIFIC DETECTION: Deauth Frames
     if packet.haslayer(Dot11Deauth):
-        source_mac = packet.addr2 # The MAC of the sender
-        now = time.time()
-        
-        if source_mac not in packet_counts:
-            packet_counts[source_mac] = []
-        
+        if source_mac not in packet_counts: packet_counts[source_mac] = []
         packet_counts[source_mac].append(now)
-        
-        # Keep only packets from the last X seconds
         packet_counts[source_mac] = [t for t in packet_counts[source_mac] if now - t < WINDOW_SECONDS]
         
-        # If the count exceeds threshold, log a flood alert
         if len(packet_counts[source_mac]) >= DEAUTH_THRESHOLD:
-            log_alert(
-                "DEAUTH_FLOOD", 
-                source_mac, 
-                {"packet_count": len(packet_counts[source_mac]), "msg": "Deauth flood detected via local sniffer"},
-                signal=getattr(packet, "dBm_AntSignal", None) # Signal strength if available
-            )
-            packet_counts[source_mac] = [] # Reset to avoid spamming alerts
+            log_alert("DEAUTH_ATTACK", source_mac, {"msg": "Direct Deauth detected!"}, source_ip=source_ip)
+            packet_counts[source_mac] = []
+
+    # 2. ANOMALY DETECTION: Packet Volume
+    if source_mac not in anomaly_counts: anomaly_counts[source_mac] = []
+    anomaly_counts[source_mac].append(now)
+    anomaly_counts[source_mac] = [t for t in anomaly_counts[source_mac] if now - t < WINDOW_SECONDS]
+
+    if len(anomaly_counts[source_mac]) >= ANOMALY_THRESHOLD:
+        log_alert(
+            "TRAFFIC_ANOMALY", 
+            source_mac, 
+            {"packet_count": len(anomaly_counts[source_mac]), "msg": "High-volume RF activity detected!"},
+            source_ip=source_ip
+        )
+        anomaly_counts[source_mac] = []
 
 def start_sniffer(interface):
-    """Runs the Scapy sniffer in a background thread."""
+    is_windows = os.name == 'nt'
     try:
-        scapy.sniff(iface=interface, prn=packet_callback, store=0, stop_filter=lambda x: stop_event.is_set())
-    except Exception as e:
-        console.print(f"[bold red]Sniffer Error:[/] {e}")
+        scapy.sniff(
+            iface=interface, prn=packet_callback, store=0, 
+            monitor=not is_windows, 
+            stop_filter=lambda x: stop_event.is_set()
+        )
+    except Exception:
+        try:
+            scapy.sniff(iface=interface, prn=packet_callback, store=0, stop_filter=lambda x: stop_event.is_set())
+        except Exception as e:
+            console.print(f"[bold red]Sniffer Error:[/] {e}")
 
-# --- BRIDGE: T-Embed MQTT ---
+# --- BRIDGE ---
+
+def on_connect(client, userdata, flags, rc):
+    global mqtt_status
+    if rc == 0: mqtt_status = "Online (HiveMQ)"
+    else: mqtt_status = f"Error ({rc})"
 
 def on_message(client, userdata, msg):
-    """Handles alerts sent from the T-Embed hardware via MQTT."""
     try:
         payload = json.loads(msg.payload.decode())
         log_alert(
-            payload.get("event", "HARDWARE_ALERT"),
+            payload.get("event", "CLOUD_REPORT"),
             payload.get("mac", "UNKNOWN"),
             payload.get("details", payload),
-            payload.get("signal")
+            source_ip=payload.get("ip")
         )
-    except Exception as e:
-        pass
+    except Exception: pass
 
-def start_mqtt():
-    """Connects to the Mosquitto broker to receive hardware alerts."""
-    client = mqtt.Client()
+def start_mqtt_bridge():
+    global mqtt_status
+    client_id = f"widrs-{uuid.uuid4().hex[:6]}"
+    # Use modern Callback API version 2
+    client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id=client_id)
+    client.on_connect = on_connect
     client.on_message = on_message
     try:
         client.connect(MQTT_BROKER, MQTT_PORT, 60)
         client.subscribe(MQTT_TOPIC)
-        console.print("[bold green]✓ MQTT Bridge Connected.[/]")
         client.loop_forever()
     except Exception:
-        console.print("[bold red]MQTT Error:[/] Could not connect to Mosquitto. Hardware alerts are disabled.")
+        mqtt_status = "Disconnected"
 
-# --- UI: Terminal Dashboard ---
+# --- UI ---
 
 def generate_table():
-    """Queries the database and builds the Rich table for the dashboard."""
     db = SessionLocal()
     alerts = db.query(models.Alert).order_by(models.Alert.timestamp.desc()).limit(10).all()
     db.close()
-
-    table = Table(title="Live Wireless Intrusion Events", box=box.ROUNDED, expand=True)
-    table.add_column("Timestamp", style="cyan", no_wrap=True)
-    table.add_column("Type", style="bold red")
+    table = Table(box=box.MINIMAL_DOUBLE_HEAD, expand=True)
+    table.add_column("Time", style="cyan", width=10)
+    table.add_column("Threat Type", style="bold red")
     table.add_column("Source MAC", style="green")
-    table.add_column("Signal", style="magenta")
+    table.add_column("Source IP", style="yellow")
     table.add_column("Details", style="white")
 
     for alert in alerts:
@@ -165,70 +171,114 @@ def generate_table():
             alert.timestamp.strftime("%H:%M:%S"),
             alert.event_type,
             alert.source_mac,
-            f"{alert.signal_strength or 'N/A'} dBm",
-            str(alert.details)[:50]
+            alert.source_ip or "---",
+            str(alert.details.get('msg', alert.details))[:60]
         )
     return table
 
-def inject_test_alert():
-    """Utility to verify the UI is working without needing an actual attack."""
-    log_alert("SYSTEM_TEST", "AA:BB:CC:DD:EE:FF", {"msg": "Self-test alert triggered!"})
-    console.print("[bold green]✓ Test alert injected into database.[/]")
+def reset_db():
+    """Clears all alerts from the database for a fresh start"""
+    db = SessionLocal()
+    try:
+        db.query(models.Alert).delete()
+        db.commit()
+        console.print("[bold green]✓ Alert history cleared![/]")
+    except Exception as e:
+        console.print(f"[bold red]Error clearing database:[/] {e}")
+    finally:
+        db.close()
 
-# --- MAIN ENGINE ---
+# --- MAIN RUNNER ---
 
 def main():
-    # Setup the local database
+    """Main entry point for the WIDRS CLI"""
+    # CRITICAL: The global declaration MUST be the absolute first line
+    global ANOMALY_THRESHOLD
+    
     init_db()
     
-    # Handle manual test mode: 'python run_widrs.py --test'
-    import sys
-    if "--test" in sys.argv:
-        inject_test_alert()
+    # --- COMMAND LINE ARGUMENTS ---
+    parser = argparse.ArgumentParser(
+        description="🛡️ WIDRS: Wireless Intrusion Detection & Response System",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  python run_widrs.py           # Start the live monitoring sensor
+  python run_widrs.py --test    # Inject a fake alert to test the UI
+  python run_widrs.py --reset   # Clear all alert history from the database
+        """
+    )
+    
+    parser.add_argument("--test", action="store_true", help="Inject a test alert into the database and exit")
+    parser.add_argument("--reset", action="store_true", help="Clear all stored alerts from the local database")
+    parser.add_argument("--threshold", type=int, default=ANOMALY_THRESHOLD, help=f"Set custom anomaly threshold (default: {ANOMALY_THRESHOLD})")
+    
+    # If no arguments are provided, it proceeds to start the engine
+    args, unknown = parser.parse_known_args()
+
+    # Handle --reset
+    if args.reset:
+        reset_db()
         return
 
+    # Handle --test
+    if args.test:
+        log_alert("TEST_ALERT", "FF:FF:FF:FF:FF:FF", {"msg": "System self-test successful!"})
+        console.print("[bold green]✓ Test alert injected into database.[/]")
+        return
+
+    # Update threshold if provided
+    ANOMALY_THRESHOLD = args.threshold
+
+    # --- START ENGINE ---
     console.print("[bold cyan]WIDRS Engine Starting...[/]")
     
-    # 1. Automatic Interface Detection
-    with console.status("[bold yellow]Detecting active WiFi interface...", spinner="dots"):
-        iface = get_wifi_interface()
-        time.sleep(1)
-        
-    if not iface:
-        console.print("[bold red]Error: No active WiFi interface detected![/]")
-        console.print("[yellow]Please connect to a network and try again.[/]")
-        return
+    addrs = psutil.net_if_addrs()
+    stats = psutil.net_if_stats()
+    iface = None
+    ip_address = "Offline"
     
-    console.print(f"[bold green]✓ Found active interface:[/] [bold white]{iface}[/]")
+    # Auto-detect WiFi interface and IP
+    wifi_prefixes = ('wi-fi', 'wlan', 'wlp', 'wifi', 'en')
+    for i, i_addrs in addrs.items():
+        if any(prefix in i.lower() for prefix in wifi_prefixes) and i in stats and stats[i].isup:
+            for addr in i_addrs:
+                if addr.family == 2: # AF_INET
+                    iface = i
+                    ip_address = addr.address
+                    break
+        if iface: break
+    
+    if iface:
+        console.print(f"[bold green]✓ PC Sniffer Active:[/] {iface} ({ip_address})")
+        threading.Thread(target=start_sniffer, args=(iface,), daemon=True).start()
+    else:
+        console.print("[bold yellow]! No WiFi interface detected. Sniffer disabled (Cloud Bridge remains active).[/]")
 
-    # 2. Start background tasks (Sniffer and MQTT Bridge)
-    threading.Thread(target=start_sniffer, args=(iface,), daemon=True).start()
-    threading.Thread(target=start_mqtt, daemon=True).start()
+    # Start Cloud Bridge
+    threading.Thread(target=start_mqtt_bridge, daemon=True).start()
 
-    # 3. Launch the Live Dashboard
-    with Live(console=console, screen=True, refresh_per_second=1) as live:
+    with Live(console=console, screen=True, refresh_per_second=2) as live:
         try:
             while True:
                 db = SessionLocal()
                 total = db.query(models.Alert).count()
                 db.close()
-
-                # Build the layout
+                
                 layout = Layout()
                 layout.split_column(
                     Layout(name="header", size=3),
                     Layout(name="body")
                 )
                 
-                header_content = f"🛡️  [bold blue]WIDRS CLI[/] | [bold white]Interface:[/] {iface} | [bold white]Total Alerts:[/] {total}"
-                layout["header"].update(Panel(header_content, border_style="blue"))
+                # Show Interface and IP in the header
+                status_line = f"🛡️  [bold white]WIDRS SENSOR[/]  |  [bold cyan]Cloud:[/] {mqtt_status}  |  [bold green]IP:[/] {ip_address}  |  [bold cyan]Alerts:[/] {total}"
+                layout["header"].update(Panel(status_line, border_style="blue"))
                 layout["body"].update(generate_table())
-                
                 live.update(layout)
-                time.sleep(1)
+                time.sleep(0.5)
         except KeyboardInterrupt:
             stop_event.set()
-            console.print("\n[bold yellow]Stopping WIDRS...[/]")
 
 if __name__ == "__main__":
     main()
